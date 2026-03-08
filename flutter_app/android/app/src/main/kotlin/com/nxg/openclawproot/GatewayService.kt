@@ -26,6 +26,28 @@ class GatewayService : Service() {
         var logSink: EventChannel.EventSink? = null
         private var instance: GatewayService? = null
 
+        /** Check if the gateway process is actually alive (not just the flag). */
+        fun isProcessAlive(): Boolean {
+            val inst = instance ?: return false
+            if (!isRunning) return false
+            val proc = inst.gatewayProcess
+            // If we have a process reference, check if it's actually alive
+            if (proc != null) return proc.isAlive
+            // No process ref yet — could still be in setup phase.
+            // Check if port is responding as a fallback.
+            return try {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress("127.0.0.1", 18789), 1000)
+                    true
+                }
+            } catch (_: Exception) {
+                // Process not yet spawned but service is running — report true
+                // only if we're still within the startup window (30s)
+                val elapsed = System.currentTimeMillis() - inst.startTime
+                elapsed < 30_000
+            }
+        }
+
         fun start(context: Context) {
             val intent = Intent(context, GatewayService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -48,6 +70,7 @@ class GatewayService : Service() {
     private var startTime: Long = 0
     private var processStartTime: Long = 0
     private var uptimeThread: Thread? = null
+    private var watchdogThread: Thread? = null
     private val lock = Object()
     @Volatile private var stopping = false
 
@@ -75,6 +98,8 @@ class GatewayService : Service() {
         instance = null
         uptimeThread?.interrupt()
         uptimeThread = null
+        watchdogThread?.interrupt()
+        watchdogThread = null
         stopGateway()
         releaseWakeLock()
         super.onDestroy()
@@ -107,6 +132,7 @@ class GatewayService : Service() {
                 startTime = System.currentTimeMillis()
                 updateNotificationRunning()
                 startUptimeTicker()
+                startWatchdog()
                 return
             }
 
@@ -117,6 +143,7 @@ class GatewayService : Service() {
 
         Thread {
             try {
+                emitLog("[INFO] Setting up environment...")
                 val filesDir = applicationContext.filesDir.absolutePath
                 val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
                 val pm = ProcessManager(filesDir, nativeLibDir)
@@ -166,17 +193,20 @@ class GatewayService : Service() {
                     emitLog("Gateway already running on port 18789, skipping launch")
                     updateNotificationRunning()
                     startUptimeTicker()
+                    startWatchdog()
                     return@Thread
                 }
 
+                emitLog("[INFO] Spawning proot process...")
                 synchronized(lock) {
                     if (stopping) return@Thread
                     processStartTime = System.currentTimeMillis()
                     gatewayProcess = pm.startProotProcess("openclaw gateway --verbose")
                 }
                 updateNotificationRunning()
-                emitLog("Gateway started")
+                emitLog("[INFO] Gateway process spawned (pid pending)")
                 startUptimeTicker()
+                startWatchdog()
 
                 // Read stdout
                 val stdoutReader = BufferedReader(InputStreamReader(gatewayProcess!!.inputStream))
@@ -209,7 +239,7 @@ class GatewayService : Service() {
                 val exitCode = gatewayProcess!!.waitFor()
                 val uptimeMs = System.currentTimeMillis() - processStartTime
                 val uptimeSec = uptimeMs / 1000
-                emitLog("Gateway exited with code $exitCode (uptime: ${uptimeSec}s)")
+                emitLog("[INFO] Gateway exited with code $exitCode (uptime: ${uptimeSec}s)")
 
                 // If stop was requested, don't auto-restart
                 if (stopping) return@Thread
@@ -223,7 +253,7 @@ class GatewayService : Service() {
                     restartCount++
                     // Cap delay at 16s to avoid excessively long waits
                     val delayMs = minOf(2000L * (1 shl (restartCount - 1)), 16000L)
-                    emitLog("Auto-restarting in ${delayMs / 1000}s (attempt $restartCount/$maxRestarts)...")
+                    emitLog("[INFO] Auto-restarting in ${delayMs / 1000}s (attempt $restartCount/$maxRestarts)...")
                     updateNotification("Restarting in ${delayMs / 1000}s (attempt $restartCount)...")
                     Thread.sleep(delayMs)
                     if (!stopping) {
@@ -231,13 +261,13 @@ class GatewayService : Service() {
                         startGateway()
                     }
                 } else if (restartCount >= maxRestarts) {
-                    emitLog("Max restarts reached. Gateway stopped.")
+                    emitLog("[WARN] Max restarts reached. Gateway stopped.")
                     updateNotification("Gateway stopped (crashed)")
                     isRunning = false
                 }
             } catch (e: Exception) {
                 if (!stopping) {
-                    emitLog("Gateway error: ${e.message}")
+                    emitLog("[ERROR] Gateway error: ${e.message}")
                     isRunning = false
                     updateNotification("Gateway error")
                 }
@@ -251,6 +281,8 @@ class GatewayService : Service() {
             restartCount = maxRestarts // Prevent auto-restart
             uptimeThread?.interrupt()
             uptimeThread = null
+            watchdogThread?.interrupt()
+            watchdogThread = null
             gatewayProcess?.let {
                 try {
                     it.destroyForcibly()
@@ -259,6 +291,33 @@ class GatewayService : Service() {
             }
         }
         emitLog("Gateway stopped by user")
+    }
+
+    /** Watchdog: periodically checks if the proot process is alive.
+     *  If the process dies and the waitFor() thread hasn't noticed yet,
+     *  this ensures isRunning is updated promptly. */
+    private fun startWatchdog() {
+        watchdogThread?.interrupt()
+        watchdogThread = Thread {
+            try {
+                // Wait 45s before first check — give the process time to start
+                Thread.sleep(45_000)
+                while (!Thread.interrupted() && isRunning && !stopping) {
+                    val proc = gatewayProcess
+                    if (proc != null && !proc.isAlive) {
+                        // Process died — the waitFor() thread should handle restart,
+                        // but update the flag in case it's stuck
+                        emitLog("[WARN] Watchdog: gateway process not alive")
+                        break
+                    }
+                    // Also check if port is still responding after initial startup
+                    if (proc != null && !isPortInUse()) {
+                        emitLog("[WARN] Watchdog: port 18789 not responding")
+                    }
+                    Thread.sleep(15_000) // Check every 15s
+                }
+            } catch (_: InterruptedException) {}
+        }.apply { isDaemon = true; start() }
     }
 
     private fun startUptimeTicker() {

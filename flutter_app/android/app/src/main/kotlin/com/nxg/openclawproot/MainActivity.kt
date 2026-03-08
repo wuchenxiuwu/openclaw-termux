@@ -128,7 +128,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "isGatewayRunning" -> {
-                    result.success(GatewayService.isRunning)
+                    result.success(GatewayService.isProcessAlive())
                 }
                 "startTerminalService" -> {
                     try {
